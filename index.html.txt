@@ -1,0 +1,252 @@
+
+
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>期待値計算（競馬・券種自由）</title>
+<style>
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; margin: 24px; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  .controls { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-bottom:12px; }
+  button { padding:8px 12px; cursor:pointer; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  th, td { border:1px solid #ddd; padding:8px; text-align:center; }
+  th { background:#f4f4f4; position:sticky; top:0; }
+  tfoot td { background:#fafafa; font-weight:600; }
+  input[type="number"] { width:100%; box-sizing:border-box; padding:6px; }
+  input[type="text"] { width:100%; box-sizing:border-box; padding:6px; }
+  .mono { font-variant-numeric: tabular-nums; }
+  .note { font-size:12px; color:#666; margin-top:8px; }
+</style>
+</head>
+<body>
+<h1>期待値計算</h1>
+
+<div class="controls">
+  <button id="addRow">行を追加</button>
+  <button id="calc">計算</button>
+  <label><input type="checkbox" id="live"> 入力中に自動計算</label>
+  <button id="reset">全クリア</button>
+</div>
+
+<table id="tbl">
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>券種</th>
+      <th>オッズ(単一)</th>
+      <th>オッズ下限</th>
+      <th>オッズ上限</th>
+      <th>的中確率 p (0–1)</th>
+      <th>賭け金[円]/点</th>
+      <th>使用オッズ</th>
+      <th>期待回収額[円]</th>
+      <th>期待利益[円]</th>
+      <th>削除</th>
+    </tr>
+  </thead>
+  <tbody id="body">
+    <!-- 初期例2行（ワイド） -->
+  </tbody>
+  <tfoot>
+    <tr>
+      <td colspan="7">購入点数 n</td>
+      <td colspan="4" class="mono" id="n">0</td>
+    </tr>
+    <tr>
+      <td colspan="7">総賭け金[円]</td>
+      <td colspan="4" class="mono" id="sumStake">0</td>
+    </tr>
+    <tr>
+      <td colspan="7">期待回収額 合計[円]</td>
+      <td colspan="4" class="mono" id="sumReturn">0</td>
+    </tr>
+    <tr>
+      <td colspan="7">期待利益 合計[円]</td>
+      <td colspan="4" class="mono" id="sumProfit">0</td>
+    </tr>
+    <tr>
+      <td colspan="7">期待回収率[%]</td>
+      <td colspan="4" class="mono" id="roi">0</td>
+    </tr>
+  </tfoot>
+</table>
+
+<p class="note">
+使い方: 任意行にオッズ(単一 または 下限/上限の両方)と p、賭け金を入力。<br>
+使用オッズは「単一」優先。単一が空で下限・上限の両方が入っていれば平均値を使用。<br>
+pと賭け金が両方>0の行だけを購入点として集計。
+</p>
+
+<script>
+const body = document.getElementById('body');
+const addRowBtn = document.getElementById('addRow');
+const calcBtn = document.getElementById('calc');
+const liveCk = document.getElementById('live');
+const resetBtn = document.getElementById('reset');
+
+function fmt(x, digits=0) {
+  if (!isFinite(x)) return '';
+  return Number(x).toLocaleString('ja-JP', { maximumFractionDigits: digits, minimumFractionDigits: digits });
+}
+
+function toNum(v) {
+  const x = parseFloat(String(v).replace(/,/g,''));
+  return isNaN(x) ? 0 : x;
+}
+
+function rowTemplate(i, preset={}) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `
+    <td class="mono idx">${i}</td>
+    <td><input type="text" class="kind" placeholder="例: ワイド"></td>
+    <td><input type="number" step="0.1" class="oddsSingle" inputmode="decimal"></td>
+    <td><input type="number" step="0.1" class="oddsMin" inputmode="decimal"></td>
+    <td><input type="number" step="0.1" class="oddsMax" inputmode="decimal"></td>
+    <td><input type="number" step="0.01" class="p" inputmode="decimal" min="0" max="1"></td>
+    <td><input type="number" step="100" class="stake" inputmode="numeric" min="0" value="100"></td>
+    <td class="mono usedOdds"></td>
+    <td class="mono evReturn"></td>
+    <td class="mono evProfit"></td>
+    <td><button class="del">×</button></td>
+  `;
+  // preset
+  if (preset.kind) tr.querySelector('.kind').value = preset.kind;
+  if (preset.os != null) tr.querySelector('.oddsSingle').value = preset.os;
+  if (preset.omn != null) tr.querySelector('.oddsMin').value = preset.omn;
+  if (preset.omx != null) tr.querySelector('.oddsMax').value = preset.omx;
+  if (preset.p != null) tr.querySelector('.p').value = preset.p;
+  if (preset.stk != null) tr.querySelector('.stake').value = preset.stk;
+
+  // delete handler
+  tr.querySelector('.del').addEventListener('click', () => {
+    tr.remove();
+    reindex();
+    calculate();
+    saveState();
+  });
+
+  // live recalc
+  tr.querySelectorAll('input').forEach(inp => {
+    inp.addEventListener('input', () => {
+      if (liveCk.checked) {
+        calculate();
+        saveState();
+      }
+    });
+  });
+
+  return tr;
+}
+
+function reindex() {
+  [...body.querySelectorAll('.idx')].forEach((td, k) => td.textContent = k + 1);
+}
+
+function addRow(preset) {
+  const tr = rowTemplate(body.children.length + 1, preset);
+  body.appendChild(tr);
+}
+
+function calculate() {
+  let n = 0, sumStake = 0, sumReturn = 0, sumProfit = 0;
+
+  [...body.rows].forEach(tr => {
+    const os = toNum(tr.querySelector('.oddsSingle').value);
+    const omin = toNum(tr.querySelector('.oddsMin').value);
+    const omax = toNum(tr.querySelector('.oddsMax').value);
+    const p = toNum(tr.querySelector('.p').value);
+    const stake = toNum(tr.querySelector('.stake').value);
+
+    // 使用オッズ決定
+    let used = 0;
+    if (os > 0) used = os;
+    else if (omin > 0 && omax > 0) used = (omin + omax) / 2;
+
+    // EV
+    const evReturn = stake * p * used;     // 期待回収額
+    const evProfit = evReturn - stake;     // 期待利益
+
+    // 表示
+    tr.querySelector('.usedOdds').textContent = used ? used.toFixed(2) : '';
+    tr.querySelector('.evReturn').textContent = evReturn ? fmt(evReturn) : '';
+    tr.querySelector('.evProfit').textContent = evProfit ? fmt(evProfit) : '';
+
+    // 集計対象
+    if (p > 0 && stake > 0) {
+      n += 1;
+      sumStake += stake;
+      sumReturn += evReturn;
+      sumProfit += evProfit;
+    }
+  });
+
+  document.getElementById('n').textContent = fmt(n);
+  document.getElementById('sumStake').textContent = fmt(sumStake);
+  document.getElementById('sumReturn').textContent = fmt(sumReturn);
+  document.getElementById('sumProfit').textContent = fmt(sumProfit);
+  const roi = sumStake > 0 ? (sumReturn / sumStake * 100) : 0;
+  document.getElementById('roi').textContent = sumStake > 0 ? roi.toFixed(1) : '0';
+}
+
+function saveState() {
+  const rows = [...body.rows].map(tr => ({
+    kind: tr.querySelector('.kind').value || '',
+    os: tr.querySelector('.oddsSingle').value || '',
+    omin: tr.querySelector('.oddsMin').value || '',
+    omax: tr.querySelector('.oddsMax').value || '',
+    p: tr.querySelector('.p').value || '',
+    stake: tr.querySelector('.stake').value || ''
+  }));
+  const state = { rows, live: liveCk.checked };
+  localStorage.setItem('ev_calc_state', JSON.stringify(state));
+}
+
+function loadState() {
+  const s = localStorage.getItem('ev_calc_state');
+  if (!s) return false;
+  try {
+    const state = JSON.parse(s);
+    body.innerHTML = '';
+    (state.rows || []).forEach(r => addRow({
+      kind:r.kind, os: numOrNull(r.os), omn: numOrNull(r.omin), omx: numOrNull(r.omax),
+      p: numOrNull(r.p), stk: numOrNull(r.stake)
+    }));
+    liveCk.checked = !!state.live;
+    if (body.rows.length === 0) bootstrapRows();
+    calculate();
+    return true;
+  } catch { return false; }
+}
+
+function numOrNull(v){ const x = parseFloat(v); return isNaN(x)? null : x; }
+
+function bootstrapRows() {
+  addRow({ kind:'ワイド', omn:4.3, omx:4.9, p:0.30, stk:100 });
+  addRow({ kind:'ワイド', omn:6.3, omx:6.7, p:0.20, stk:100 });
+}
+
+addRowBtn.addEventListener('click', () => { addRow(); reindex(); });
+calcBtn.addEventListener('click', () => { calculate(); saveState(); });
+resetBtn.addEventListener('click', () => {
+  localStorage.removeItem('ev_calc_state');
+  body.innerHTML = '';
+  bootstrapRows();
+  reindex();
+  calculate();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') saveState();
+});
+
+// 初期化
+if (!loadState()) {
+  bootstrapRows();
+  calculate();
+}
+</script>
+</body>
+</html>
